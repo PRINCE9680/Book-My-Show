@@ -1,0 +1,149 @@
+pipeline {
+    agent any
+    
+    tools {
+        nodejs 'Node-24'
+    }
+    
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        SONAR_TOKEN = credentials('sonarqube-token')
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        
+        stage('Checkout code from git') {
+            steps {
+                git branch: 'main', url: 'https://github.com/PRINCE9680/Book-My-Show.git'
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQubeServer') {
+                    sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                            -Dsonar.projectKey=Book-My-Show \
+                            -Dsonar.projectName=Book-My-Show \
+                            -Dsonar.sources=. \
+                            -Dsonar.host.url=http://13.62.51.110:9000 \
+                            -Dsonar.login=$SONAR_TOKEN
+                    '''
+
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonarqube-token'
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+             steps {
+                sh '''
+                    echo "Starting dependency installation in bookmyshow-app..."
+                    cd bookmyshow-app
+                    if [ -f package.json ]; then
+                        echo "package.json found. Cleaning previous installs..."
+                        rm -rf node_modules package-lock.json
+
+                        echo "Running npm install..."
+                        npm install
+                    else
+                       echo "Error: package.json not found in bookmyshow-app!"
+                       exit 1
+                    fi
+                '''
+           }
+        }
+        
+        stage('Docker Build & Push') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', passwordVariable: 'DOCKERHUB_PASS', usernameVariable: 'DOCKERHUB_USER')]) {
+                    sh '''
+                        cd bookmyshow-app/
+                        echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USER" --password-stdin
+                        docker build -t bms:v1 .
+                        docker tag bms:v1 prince5678/bms:v1
+                        docker push prince5678/bms:v1
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Docker Container') {
+            steps{
+                sh 'docker run -d --name bms-app -p 80:3000 prince5678/bms:v1'
+            }
+        }
+        
+        stage('Deploy to Kubernetes cluster') {
+            steps{
+                script {
+                    withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-eks-creds', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                        sh '''
+                            aws eks update-kubeconfig --region eu-north-1 --name Bastion-host1
+                            
+                            # Validate cluster access
+                            kubectl get nodes
+
+                            # Deploy to Kubernetes
+                            kubectl apply -f deployment.yml
+                            kubectl apply -f service.yml
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            emailext (
+                subject: "SUCCESS: SonarQube Quality Gate Passed",
+                body: """
+                Hi Team,
+                
+                The SonarQube quality gate passed successfully.
+
+                You can view the report here:
+                http://13.62.51.110:9000/dashboard?id=Book-My-Show
+                username: admin, passwd: 12345
+
+                If you want to download a PDF report, please use the SonarQube interface or a PDF plugin.
+
+                Regards,
+                Jenkins
+                """,
+                to: 'rajprince9680@gmail.com'
+            )
+        }
+        failure {
+            emailext (
+                subject: "FAILED: SonarQube Quality Gate",
+                body: """
+                Hi Team,
+                
+                The SonarQube quality gate has failed.
+                
+                Please check the details:
+                http://13.62.51.110:9000/dashboard?id=Book-My-Show
+                username: admin, passwd: 12345
+                
+                Regards,
+                Jenkins
+                """,
+                to: 'rajprince9680@gmail.com'
+            )
+        }
+    }
+}
